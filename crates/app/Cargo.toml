@@ -1,0 +1,25 @@
+[package]
+name = "meeting-transcriber"
+description = "Desktop app: records meetings and transcribes them live."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+capture.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+eframe.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+soniox.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit.workspace = true
+security-framework.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+keyring.workspace = true
