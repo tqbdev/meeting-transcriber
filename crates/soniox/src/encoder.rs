@@ -80,6 +80,22 @@ impl PcmEncoder {
     }
 }
 
+impl PcmEncoder {
+    /// Flushes audio still waiting for a full resampler chunk, padding the
+    /// last chunk with silence.
+    pub(crate) fn finish(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        let Some(resampler) = &self.resampler else {
+            return Ok(());
+        };
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let needed = resampler.input_frames_next();
+        let padding = needed.saturating_sub(self.pending.len()) * self.channels;
+        self.push(&vec![0.0; padding], out)
+    }
+}
+
 fn write_s16le(samples: &[f32], out: &mut Vec<u8>) {
     out.reserve(samples.len() * 2);
     for &sample in samples {

@@ -4,13 +4,19 @@
 // No console window behind the app in Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod fill;
 mod live;
 mod overlay;
 mod platform;
+mod recordings;
 mod secrets;
 mod transcript;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use capture::{DeviceInfo, Recording, Session, SessionOptions, Source, SystemOutput, TrackLevel};
 use eframe::egui;
@@ -50,10 +56,31 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// "Meeting Transcriber · built Sep 30 15:41"
+fn window_title() -> String {
+    format!("Meeting Transcriber · built {}", env!("BUILD_TIME"))
+}
+
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--fill-gaps") {
+        let Some(dir) = args.get(i + 1) else {
+            eprintln!("usage: meeting-transcriber --fill-gaps <recording folder> [--yes]");
+            std::process::exit(2);
+        };
+        let yes = args.iter().any(|a| a == "--yes");
+        std::process::exit(match fill_from_command_line(Path::new(dir), yes) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                1
+            }
+        });
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Meeting Transcriber")
+            .with_title(window_title())
             .with_inner_size([820.0, 760.0])
             .with_min_inner_size([520.0, 480.0]),
         ..Default::default()
@@ -63,6 +90,76 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))),
     )
+}
+
+/// `--fill-gaps <folder> [--yes]`: lists a recording's missing parts and the
+/// cost, and with `--yes` fills them. Same code path as the Fill gaps button.
+fn fill_from_command_line(dir: &Path, yes: bool) -> anyhow::Result<()> {
+    let gaps = fill::find_gaps(dir)?;
+    if gaps.is_empty() {
+        println!("Nothing missing in {}.", dir.display());
+        return Ok(());
+    }
+    let settings = live::Settings::load();
+    let options = fill_options(&settings, dir);
+    let translating = options.meta.translation.is_some();
+    println!("Missing in {}:", dir.display());
+    for gap in &gaps {
+        println!("  {}", fill::gap_label(gap));
+    }
+    println!(
+        "{:.1} min of audio, about ${:.2}{}.",
+        fill::total_minutes(&gaps),
+        fill::cost_usd(&gaps, translating),
+        if translating { " with translation" } else { "" }
+    );
+    if !yes {
+        println!("Dry run. Add --yes to fill.");
+        return Ok(());
+    }
+    anyhow::ensure!(settings.has_key(), "no Soniox API key saved");
+    let runtime = tokio::runtime::Runtime::new()?;
+    let outcome = runtime.block_on(fill::fill(dir.to_owned(), gaps, options, |progress| {
+        let fill::Progress {
+            index,
+            count,
+            gap,
+            stage,
+        } = progress;
+        println!(
+            "  {} of {count} · {} · {stage:?}",
+            index + 1,
+            fill::gap_label(&gap)
+        );
+    }));
+    remember_leftovers(outcome.leftovers);
+    let lines = outcome.lines?;
+    println!("Done: {lines} lines added to transcript.jsonl.");
+    Ok(())
+}
+
+/// Fill settings for a recording: what it was recorded with, or the current
+/// settings (without translation) for recordings older than `recording.json`.
+fn fill_options(settings: &live::Settings, dir: &Path) -> fill::FillOptions {
+    let meta = fill::RecordingMeta::load(dir).unwrap_or_else(|| fill::RecordingMeta {
+        language_hints: settings.language_hint_list(),
+        terms: settings.term_list(),
+        ..Default::default()
+    });
+    fill::FillOptions {
+        api_key: settings.api_key.trim().to_owned(),
+        meta,
+    }
+}
+
+/// Adds clips or jobs still stored on Soniox to the list deleted at launch.
+fn remember_leftovers(leftovers: Vec<soniox::files::Leftover>) {
+    if leftovers.is_empty() {
+        return;
+    }
+    let mut all = fill::load_pending_deletes();
+    all.extend(leftovers);
+    let _ = fill::save_pending_deletes(&all);
 }
 
 /// Display state for one level meter.
@@ -89,6 +186,14 @@ struct App {
     meters: Vec<Meter>,
     last_recordings: Vec<Recording>,
     errors: Vec<String>,
+    /// `None` only if the network runtime failed to start.
+    recordings: Option<recordings::Recordings>,
+    /// A past recording's transcript shown instead of the live one.
+    viewing: Option<(PathBuf, transcript::Transcript)>,
+    /// Folder of the latest recording.
+    last_dir: Option<PathBuf>,
+    /// Set at Stop: check (and maybe fill) this recording once its streams finish.
+    after_stop: Option<PathBuf>,
 }
 
 impl App {
@@ -113,8 +218,33 @@ impl App {
             meters: Vec::new(),
             last_recordings: Vec::new(),
             errors,
+            recordings: None,
+            viewing: None,
+            last_dir: None,
+            after_stop: None,
         };
         app.refresh_devices();
+        if let Some(live) = &app.live {
+            app.recordings = Some(recordings::Recordings::new(
+                recordings_root(),
+                live.runtime().clone(),
+                ctx.clone(),
+            ));
+            // Clips or jobs a previous fill couldn't delete on Soniox.
+            let pending = fill::load_pending_deletes();
+            if !pending.is_empty() && app.settings.has_key() {
+                let key = app.settings.api_key.trim().to_owned();
+                live.runtime().spawn(async move {
+                    let mut remaining = Vec::new();
+                    for item in pending {
+                        if soniox::files::delete(&key, &item).await.is_err() {
+                            remaining.push(item);
+                        }
+                    }
+                    let _ = fill::save_pending_deletes(&remaining);
+                });
+            }
+        }
         #[cfg(debug_assertions)]
         if std::env::var_os("MEETING_TRANSCRIBER_DEMO").is_some()
             && let Some(live) = &mut app.live
@@ -152,6 +282,26 @@ impl App {
         .into_iter()
         .filter_map(|(on, source)| on.then_some(source))
         .collect();
+
+        let meta = fill::RecordingMeta {
+            started_at: chrono::Local::now().to_rfc3339(),
+            build: env!("BUILD_TIME").to_owned(),
+            language_hints: self.settings.language_hint_list(),
+            terms: self.settings.term_list(),
+            translation: self
+                .settings
+                .translating()
+                .then(|| self.settings.translation())
+                .flatten(),
+        };
+        if let Err(e) = std::fs::create_dir_all(&out_dir)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| meta.save(&out_dir))
+        {
+            self.errors.push(format!("{e:#}"));
+        }
+        self.last_dir = Some(out_dir.clone());
+        self.viewing = None;
 
         let mut sinks = None;
         if self.settings.enabled
@@ -203,6 +353,7 @@ impl App {
             Err(e) => self.errors.push(format!("Stopping: {e:#}")),
         }
         self.meters.clear();
+        self.after_stop = self.last_dir.clone();
     }
 
     /// Pulls the latest peaks from the capture threads into the meters.
@@ -214,6 +365,7 @@ impl App {
                 self.ctx.request_repaint_of(overlay::id());
             }
         }
+        self.poll_recordings();
         let Some(session) = &self.session else {
             return;
         };
@@ -228,6 +380,69 @@ impl App {
                 meter.silent_for + dt
             };
             meter.level = level;
+        }
+    }
+
+    fn poll_recordings(&mut self) {
+        let Some(recordings) = &mut self.recordings else {
+            return;
+        };
+        let changes = recordings.poll();
+        self.errors.extend(changes.errors);
+        remember_leftovers(changes.leftovers);
+        if let Some((dir, transcript)) = &mut self.viewing
+            && changes.filled.contains(dir)
+            && let Ok(reloaded) = transcript::Transcript::load(&dir.join("transcript.jsonl"))
+        {
+            *transcript = reloaded;
+        }
+        // Once the stopped recording's streams have finished, see what's
+        // missing, and fill it if that's switched on.
+        let streams_done = self.live.as_ref().is_none_or(live::Live::current_done);
+        if self.session.is_none()
+            && streams_done
+            && let Some(dir) = self.after_stop.take()
+        {
+            if self.settings.enabled && self.settings.auto_fill_gaps && self.settings.has_key() {
+                recordings.auto_fill(&dir, fill_options(&self.settings, &dir));
+            } else {
+                recordings.recheck(&dir);
+            }
+        }
+    }
+
+    /// The recording that can't be checked or filled yet.
+    fn busy_dir(&self) -> Option<PathBuf> {
+        let streams_done = self.live.as_ref().is_none_or(live::Live::current_done);
+        if self.session.is_some() || !streams_done {
+            self.last_dir.clone()
+        } else {
+            None
+        }
+    }
+
+    fn past_recordings_ui(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy_dir();
+        let has_key = self.settings.has_key();
+        let settings = &self.settings;
+        let Some(recordings) = &mut self.recordings else {
+            return;
+        };
+        let mut view = None;
+        egui::CollapsingHeader::new("Recordings").show(ui, |ui| {
+            if let Some(recordings::Action::View(dir)) =
+                recordings.ui(ui, busy.as_deref(), has_key, |dir| {
+                    fill_options(settings, dir)
+                })
+            {
+                view = Some(dir);
+            }
+        });
+        if let Some(dir) = view {
+            match transcript::Transcript::load(&dir.join("transcript.jsonl")) {
+                Ok(t) => self.viewing = Some((dir, t)),
+                Err(e) => self.errors.push(format!("Opening the transcript: {e}")),
+            }
         }
     }
 
@@ -436,7 +651,10 @@ impl eframe::App for App {
 
         egui::Panel::top("controls").show(ui, |ui| {
             ui.add_space(6.0);
-            ui.heading("Meeting Transcriber");
+            ui.horizontal(|ui| {
+                ui.heading("Meeting Transcriber");
+                ui.weak(format!("built {}", env!("BUILD_TIME")));
+            });
             ui.add_space(6.0);
 
             self.sources_ui(ui);
@@ -482,13 +700,31 @@ impl eframe::App for App {
             ui.add_space(8.0);
             self.meters_ui(ui);
             self.recordings_ui(ui);
+            self.past_recordings_ui(ui);
             self.errors_ui(ui);
             ui.weak(format!("Saving to {}", recordings_root().display()));
             ui.add_space(6.0);
         });
 
         let transcript = self.live.as_ref().map(live::Live::transcript);
+        let mut back_to_live = false;
         egui::CentralPanel::default().show(ui, |ui| {
+            if let Some((dir, past)) = &self.viewing {
+                ui.horizontal(|ui| {
+                    let name = dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().replace('_', " "));
+                    ui.strong(format!("Viewing {}", name.unwrap_or_default()));
+                    back_to_live = ui.button("Back to live").clicked();
+                });
+                ui.separator();
+                if past.is_empty() {
+                    ui.weak("This recording has no transcript.");
+                } else {
+                    past.ui(ui, 14.0, self.settings.show_translation);
+                }
+                return;
+            }
             let transcript = transcript.as_ref().map(|t| t.lock().unwrap());
             match transcript {
                 Some(t) if !t.is_empty() => t.ui(ui, 14.0, self.settings.show_translation),
@@ -500,6 +736,9 @@ impl eframe::App for App {
             }
         });
 
+        if back_to_live {
+            self.viewing = None;
+        }
         if let Some(transcript) = transcript {
             self.overlay
                 .show(ui.ctx(), transcript, self.settings.show_translation);

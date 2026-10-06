@@ -11,6 +11,7 @@ capture.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 eframe.workspace = true
+hound.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 soniox.workspace = true
@@ -23,3 +24,6 @@ security-framework.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 keyring.workspace = true
+
+[build-dependencies]
+chrono.workspace = true

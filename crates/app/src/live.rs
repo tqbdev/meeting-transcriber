@@ -3,8 +3,11 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    fs::File,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
@@ -13,7 +16,10 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use soniox::Event;
 
-use crate::{secrets, transcript::Transcript};
+use crate::{
+    secrets,
+    transcript::{Transcript, source_name},
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +55,8 @@ pub struct Settings {
     pub language_b: String,
     /// Display only, so it can change mid-recording.
     pub show_translation: bool,
+    /// Fill untranscribed parts from the recording right after Stop.
+    pub auto_fill_gaps: bool,
 }
 
 impl Default for Settings {
@@ -64,6 +72,7 @@ impl Default for Settings {
             language_a: "en".to_owned(),
             language_b: "vi".to_owned(),
             show_translation: true,
+            auto_fill_gaps: false,
         }
     }
 }
@@ -112,7 +121,15 @@ impl Settings {
         Ok(())
     }
 
-    fn translation(&self) -> Option<soniox::Translation> {
+    pub fn language_hint_list(&self) -> Vec<String> {
+        split_list(&self.languages)
+    }
+
+    pub fn term_list(&self) -> Vec<String> {
+        split_list(&self.terms)
+    }
+
+    pub fn translation(&self) -> Option<soniox::Translation> {
         match self.translation {
             TranslationMode::Off => None,
             TranslationMode::OneWay => Some(soniox::Translation::OneWay {
@@ -189,6 +206,19 @@ impl Settings {
 
                     ui.label("Translation");
                     changed |= self.translation_ui(ui);
+                    ui.end_row();
+
+                    ui.label("Gaps");
+                    changed |= ui
+                        .checkbox(
+                            &mut self.auto_fill_gaps,
+                            "Fill untranscribed parts automatically after Stop",
+                        )
+                        .on_hover_text(
+                            "Sends only the missing parts of the recording to Soniox's file API \
+                             (about $0.10 per hour of audio), then deletes them there.",
+                        )
+                        .changed();
                     ui.end_row();
                 });
         });
@@ -304,20 +334,31 @@ pub enum Status {
 /// Shared with the always-on-top window, which draws on its own schedule.
 pub type SharedTranscript = Arc<Mutex<Transcript>>;
 
+/// After this long without Soniox, say plainly that the live transcript is
+/// paused, beyond the small status line.
+const PAUSED_NOTICE_AFTER: Duration = Duration::from_secs(120);
+
 /// One recording's transcription. Kept after the next recording starts until
 /// its streams finish, so the tail of the old transcript is still saved.
 struct Run {
     transcript: SharedTranscript,
     streams: HashMap<Source, Status>,
     drops: HashMap<Source, Drops>,
+    /// `soniox.log` next to the recording: connections, drops, gaps.
+    log: Option<BufWriter<File>>,
+    /// Wall-clock start, to turn stream positions into times of day.
+    started: chrono::DateTime<chrono::Local>,
 }
 
-/// Connection drops on one stream, for the status line.
+/// Connection drops on one stream, for the status line and markers.
 #[derive(Default)]
 struct Drops {
     count: u32,
     attempt: u32,
     last_reason: String,
+    /// Set during an outage: when it began, and how far the stream had got.
+    down_since: Option<Instant>,
+    dropped_at_ms: u64,
 }
 
 impl Run {
@@ -325,6 +366,45 @@ impl Run {
         self.streams
             .values()
             .all(|s| matches!(s, Status::Finished | Status::Failed))
+    }
+
+    fn log(&mut self, source: Source, message: &str) {
+        if let Some(log) = &mut self.log {
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let _ = writeln!(log, "{now} [{}] {message}", source_name(source));
+            let _ = log.flush();
+        }
+    }
+
+    /// "15:11" for a position in the stream.
+    fn time_of_day(&self, at_ms: u64) -> String {
+        let at = self.started + chrono::Duration::milliseconds(at_ms as i64);
+        at.format("%H:%M").to_string()
+    }
+
+    fn paused_notice(&self) -> Option<String> {
+        let longest = self
+            .drops
+            .values()
+            .filter_map(|d| d.down_since)
+            .map(|since| since.elapsed())
+            .max()?;
+        (longest >= PAUSED_NOTICE_AFTER).then(|| {
+            format!(
+                "Live transcript paused: Soniox unreachable for {} min. Recording continues, \
+                 and the missed part can be filled from Recordings afterwards.",
+                longest.as_secs() / 60
+            )
+        })
+    }
+}
+
+fn seconds(duration: Duration) -> String {
+    let secs = duration.as_secs_f32();
+    if secs < 60.0 {
+        format!("{secs:.0} s")
+    } else {
+        format!("{:.0} min", secs / 60.0)
     }
 }
 
@@ -343,7 +423,7 @@ pub struct Live {
 impl Live {
     pub fn new() -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            .worker_threads(2)
             .thread_name("soniox")
             .enable_all()
             .build()
@@ -359,11 +439,20 @@ impl Live {
         })
     }
 
+    pub fn runtime(&self) -> &tokio::runtime::Handle {
+        self.runtime.handle()
+    }
+
     /// The transcript of the latest recording.
     pub fn transcript(&self) -> SharedTranscript {
         self.runs
             .get(&self.current)
             .map_or_else(|| self.empty.clone(), |run| run.transcript.clone())
+    }
+
+    /// Whether every stream of the latest recording has finished or failed.
+    pub fn current_done(&self) -> bool {
+        self.runs.get(&self.current).is_none_or(Run::done)
     }
 
     /// Starts a transcript for a new recording in `out_dir` and returns the
@@ -379,16 +468,25 @@ impl Live {
         let transcript =
             Transcript::create(&out_dir.join("transcript.jsonl"), settings.translating())
                 .context("creating transcript.jsonl")?;
+        let log = File::create(out_dir.join("soniox.log"))
+            .map(BufWriter::new)
+            .ok();
         self.current += 1;
         let run_id = self.current;
-        self.runs.insert(
-            run_id,
-            Run {
-                transcript: Arc::new(Mutex::new(transcript)),
-                streams: sources.iter().map(|&s| (s, Status::Connecting)).collect(),
-                drops: HashMap::new(),
-            },
-        );
+        let mut run = Run {
+            transcript: Arc::new(Mutex::new(transcript)),
+            streams: sources.iter().map(|&s| (s, Status::Connecting)).collect(),
+            drops: HashMap::new(),
+            log,
+            started: chrono::Local::now(),
+        };
+        for &source in sources {
+            run.log(
+                source,
+                &format!("starting, model {}", soniox::DEFAULT_MODEL),
+            );
+        }
+        self.runs.insert(run_id, run);
 
         let session = out_dir
             .file_name()
@@ -419,7 +517,11 @@ impl Live {
                 match soniox::start(&handle, config, input, on_event) {
                     Ok(mut feed) => Some(Box::new(move |samples: &[f32]| feed.push(samples))),
                     Err(e) => {
-                        let _ = events.send((run_id, source, Event::Failed(format!("{e:#}"))));
+                        let failed = Event::Failed {
+                            reason: format!("{e:#}"),
+                            transcribed_ms: 0,
+                        };
+                        let _ = events.send((run_id, source, failed));
                         None
                     }
                 }
@@ -437,6 +539,8 @@ impl Live {
                 transcript: Arc::new(Mutex::new(crate::transcript::demo())),
                 streams: HashMap::new(),
                 drops: HashMap::new(),
+                log: None,
+                started: chrono::Local::now(),
             },
         );
     }
@@ -463,39 +567,21 @@ impl Live {
                 continue;
             };
             changed |= run_id == self.current;
-            let mut transcript = run.transcript.lock().unwrap();
-            let result = match event {
-                Event::Connected => {
-                    run.streams.insert(source, Status::Live);
-                    Ok(())
-                }
-                Event::Reconnecting { attempt, reason } => {
-                    let previous = run.streams.insert(source, Status::Reconnecting);
-                    let drops = run.drops.entry(source).or_default();
-                    if previous != Some(Status::Reconnecting) {
-                        drops.count += 1;
-                    }
-                    drops.attempt = attempt;
-                    drops.last_reason = reason;
-                    // The provisional tail is re-transcribed after reconnecting.
-                    transcript.apply(source, &[], vec![])
-                }
-                Event::Tokens {
-                    finals,
-                    provisional,
-                } => transcript.apply(source, &finals, provisional),
-                Event::Finished => {
-                    run.streams.insert(source, Status::Finished);
-                    transcript.finish(source)
-                }
-                Event::Failed(message) => {
-                    run.streams.insert(source, Status::Failed);
-                    errors.push(format!("Soniox, {}: {message}", source.label()));
-                    transcript.finish(source)
-                }
-            };
-            if let Err(e) = result {
+            if let Err(e) = apply(run, source, event, &mut errors) {
                 errors.push(format!("Writing transcript: {e}"));
+            }
+            if run.done() {
+                run.transcript.lock().unwrap().close_log();
+                run.log = None;
+            }
+        }
+        // The notice depends on time passing, not only on events.
+        if let Some(run) = self.runs.get(&self.current) {
+            let notice = run.paused_notice();
+            let mut transcript = run.transcript.lock().unwrap();
+            if transcript.banner != notice {
+                transcript.banner = notice;
+                changed = true;
             }
         }
         let current = self.current;
@@ -533,6 +619,90 @@ impl Live {
             if let Some(d) = drops {
                 response.on_hover_text(format!("Last connection drop: {}", d.last_reason));
             }
+        }
+    }
+}
+
+/// One Soniox event into the run's status, transcript and log.
+fn apply(
+    run: &mut Run,
+    source: Source,
+    event: Event,
+    errors: &mut Vec<String>,
+) -> std::io::Result<()> {
+    let transcript = run.transcript.clone();
+    let mut transcript = transcript.lock().unwrap();
+    match event {
+        Event::Connected { after, resent_ms } => {
+            run.streams.insert(source, Status::Live);
+            match after {
+                None => run.log(source, "connected"),
+                Some(after) => {
+                    let at_ms = run.drops.get(&source).map_or(0, |d| d.dropped_at_ms);
+                    let text = format!(
+                        "connection dropped {}, reconnected after {}",
+                        run.time_of_day(at_ms),
+                        seconds(after)
+                    );
+                    run.log(
+                        source,
+                        &format!(
+                            "{text}, resending {:.1} s of audio",
+                            resent_ms as f32 / 1000.0
+                        ),
+                    );
+                    if let Some(drops) = run.drops.get_mut(&source) {
+                        drops.down_since = None;
+                    }
+                    transcript.add_marker(source, at_ms, text)?;
+                }
+            }
+            Ok(())
+        }
+        Event::Reconnecting {
+            attempt,
+            reason,
+            down_for,
+            at_ms,
+        } => {
+            run.streams.insert(source, Status::Reconnecting);
+            run.log(source, &format!("dropped (try {attempt}): {reason}"));
+            let drops = run.drops.entry(source).or_default();
+            if drops.down_since.is_none() {
+                drops.count += 1;
+                drops.dropped_at_ms = at_ms;
+                drops.down_since = Some(Instant::now() - down_for);
+            }
+            drops.attempt = attempt;
+            drops.last_reason = reason;
+            // The provisional tail is re-transcribed after reconnecting.
+            transcript.apply(source, &[], vec![])
+        }
+        Event::AudioDropped { from_ms, to_ms } => {
+            run.log(
+                source,
+                &format!("not transcribing {from_ms}..{to_ms} ms live (outage too long)"),
+            );
+            transcript.add_gap(source, from_ms, Some(to_ms))
+        }
+        Event::Tokens {
+            finals,
+            provisional,
+        } => transcript.apply(source, &finals, provisional),
+        Event::Finished => {
+            run.streams.insert(source, Status::Finished);
+            run.log(source, "finished");
+            transcript.finish(source)
+        }
+        Event::Failed {
+            reason,
+            transcribed_ms,
+        } => {
+            run.streams.insert(source, Status::Failed);
+            run.log(source, &format!("gave up at {transcribed_ms} ms: {reason}"));
+            errors.push(format!("Soniox, {}: {reason}", source.label()));
+            transcript.finish(source)?;
+            transcript.add_gap(source, transcribed_ms, None)
         }
     }
 }

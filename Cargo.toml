@@ -23,6 +23,7 @@ objc2 = "0.6"
 objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "multipart", "json"] }
 rtrb = "0.4"
 rubato = "5"
 security-framework = "3.7"

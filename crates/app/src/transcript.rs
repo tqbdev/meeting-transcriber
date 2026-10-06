@@ -1,6 +1,12 @@
 //! Merges the "me" and "them" Soniox streams into one transcript: finished
 //! segments in time order, plus one live line per stream that may still change.
 //! With translation on, each segment also collects its translated text.
+//!
+//! `transcript.jsonl` holds one record per line. Spoken lines have no `type`
+//! field; other records are `{"type": "marker"}` (a note such as a dropped
+//! connection), `{"type": "gap"}` (audio the live stream never transcribed)
+//! and `{"type": "fill"}` (a range later transcribed from the recording).
+//! Times are milliseconds from the start of the recording.
 
 use std::{
     collections::HashMap,
@@ -30,12 +36,73 @@ pub struct Segment {
     /// Translated text, empty when translation is off or the segment was
     /// already in the target language.
     pub translation: String,
+    /// Transcribed afterwards from the recording, not live.
+    pub filled: bool,
+}
+
+impl Segment {
+    /// The line as stored in `transcript.jsonl`.
+    pub fn record(&self) -> serde_json::Value {
+        let mut line = serde_json::json!({
+            "source": source_name(self.source),
+            "speaker": self.speaker,
+            "language": self.language,
+            "start_ms": self.start_ms,
+            "end_ms": self.end_ms,
+            "text": self.text,
+        });
+        let translation = self.translation.trim();
+        if !translation.is_empty() {
+            line["translation"] = translation.into();
+        }
+        if self.filled {
+            line["filled"] = true.into();
+        }
+        line
+    }
+}
+
+/// A note in the timeline, such as a dropped connection.
+#[derive(Clone, Debug)]
+struct Marker {
+    source: Source,
+    at_ms: u64,
+    text: String,
+}
+
+pub fn source_name(source: Source) -> &'static str {
+    match source {
+        Source::Mic => "mic",
+        Source::System => "system",
+    }
+}
+
+pub fn parse_source(name: &str) -> Option<Source> {
+    match name {
+        "mic" => Some(Source::Mic),
+        "system" => Some(Source::System),
+        _ => None,
+    }
+}
+
+/// `mm:ss`, or `h:mm:ss` past an hour.
+pub fn clock(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+    } else {
+        format!("{:02}:{:02}", secs / 60, secs % 60)
+    }
 }
 
 impl Segment {
     fn label(source: Source, speaker: Option<&str>) -> String {
         match (source, speaker) {
             (Source::Mic, _) => "Me".to_owned(),
+            // Filled lines use F1, F2… (see `fill`).
+            (Source::System, Some(speaker)) if speaker.starts_with('F') => {
+                format!("Them · {speaker}")
+            }
             (Source::System, Some(speaker)) => format!("Them · S{speaker}"),
             (Source::System, None) => "Them".to_owned(),
         }
@@ -56,10 +123,13 @@ struct Lane {
 #[derive(Default)]
 pub struct Transcript {
     segments: Vec<Segment>,
+    markers: Vec<Marker>,
     lanes: HashMap<Source, Lane>,
     log: Option<BufWriter<File>>,
     translating: bool,
     next_id: u64,
+    /// Shown above the transcript, e.g. "live transcript paused".
+    pub banner: Option<String>,
 }
 
 impl Transcript {
@@ -73,8 +143,90 @@ impl Transcript {
         })
     }
 
+    /// Reads a finished recording's transcript for viewing.
+    pub fn load(path: &Path) -> io::Result<Self> {
+        let mut t = Transcript::default();
+        for line in std::fs::read_to_string(path)?.lines() {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(source) = record["source"].as_str().and_then(parse_source) else {
+                continue;
+            };
+            let text = |key: &str| record[key].as_str().unwrap_or_default().to_owned();
+            let ms = |key: &str| record[key].as_u64().unwrap_or_default();
+            match record["type"].as_str() {
+                None | Some("line") => {
+                    t.next_id += 1;
+                    t.segments.push(Segment {
+                        id: t.next_id,
+                        source,
+                        speaker: record["speaker"].as_str().map(str::to_owned),
+                        language: record["language"].as_str().map(str::to_owned),
+                        start_ms: ms("start_ms"),
+                        end_ms: ms("end_ms"),
+                        text: text("text"),
+                        translation: text("translation"),
+                        filled: record["filled"].as_bool().unwrap_or(false),
+                    });
+                }
+                Some("marker") => t.markers.push(Marker {
+                    source,
+                    at_ms: ms("at_ms"),
+                    text: text("text"),
+                }),
+                _ => {}
+            }
+        }
+        t.segments.sort_by_key(|s| s.start_ms);
+        t.markers.sort_by_key(|m| m.at_ms);
+        Ok(t)
+    }
+
+    /// Adds a note to the timeline and the log.
+    pub fn add_marker(&mut self, source: Source, at_ms: u64, text: String) -> io::Result<()> {
+        if let Some(log) = &mut self.log {
+            let record = serde_json::json!({
+                "type": "marker", "source": source_name(source), "at_ms": at_ms, "text": text,
+            });
+            writeln!(log, "{record}")?;
+            log.flush()?;
+        }
+        let at = self.markers.partition_point(|m| m.at_ms <= at_ms);
+        self.markers.insert(
+            at,
+            Marker {
+                source,
+                at_ms,
+                text,
+            },
+        );
+        Ok(())
+    }
+
+    /// Records audio the live stream won't transcribe; `to_ms: None` means
+    /// to the end of the recording. The gap-filler reads these back.
+    pub fn add_gap(&mut self, source: Source, from_ms: u64, to_ms: Option<u64>) -> io::Result<()> {
+        if let Some(log) = &mut self.log {
+            let record = serde_json::json!({
+                "type": "gap", "source": source_name(source), "from_ms": from_ms, "to_ms": to_ms,
+            });
+            writeln!(log, "{record}")?;
+        }
+        let text = match to_ms {
+            Some(to) => format!(
+                "{} to {} not transcribed live · fill it from Recordings",
+                clock(from_ms),
+                clock(to)
+            ),
+            None => "live transcript stopped here · fill the rest from Recordings".to_owned(),
+        };
+        self.add_marker(source, from_ms, text)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
+            && self.markers.is_empty()
             && self.lanes.values().all(|lane| {
                 lane.open.is_none()
                     && lane.provisional.is_empty()
@@ -118,6 +270,7 @@ impl Transcript {
                     end_ms: token.end_ms,
                     text: String::new(),
                     translation: String::new(),
+                    filled: false,
                 }
             });
             open.text.push_str(&token.text);
@@ -211,28 +364,49 @@ impl Transcript {
         ) else {
             return Ok(());
         };
-        let mut line = serde_json::json!({
-            "source": match segment.source { Source::Mic => "mic", Source::System => "system" },
-            "speaker": segment.speaker,
-            "language": segment.language,
-            "start_ms": segment.start_ms,
-            "end_ms": segment.end_ms,
-            "text": segment.text,
-        });
-        let translation = segment.translation.trim();
-        if !translation.is_empty() {
-            line["translation"] = translation.into();
-        }
-        writeln!(log, "{line}")?;
+        writeln!(log, "{}", segment.record())?;
         log.flush()
     }
 
+    /// Flushes and closes `transcript.jsonl`, so the gap-filler can replace
+    /// it (Windows can't replace a file that's still open).
+    pub fn close_log(&mut self) {
+        if let Some(mut log) = self.log.take() {
+            let _ = log.flush();
+        }
+    }
+
+    /// Closes every stream and hands back the finished segments, for
+    /// building filled lines outside a live recording.
+    pub fn into_segments(mut self) -> Vec<Segment> {
+        for source in [Source::Mic, Source::System] {
+            let _ = self.close(source);
+        }
+        self.segments
+    }
+
+    /// A segmenter for filled lines: same rules as live, no log.
+    pub fn for_filling(translating: bool) -> Self {
+        Transcript {
+            translating,
+            ..Default::default()
+        }
+    }
+
     pub fn ui(&self, ui: &mut egui::Ui, font_size: f32, show_translation: bool) {
+        if let Some(banner) = &self.banner {
+            ui.colored_label(ui.visuals().warn_fg_color, banner);
+            ui.add_space(4.0);
+        }
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .stick_to_bottom(true)
             .show(ui, |ui| {
+                let mut markers = self.markers.iter().peekable();
                 for segment in &self.segments {
+                    while let Some(marker) = markers.next_if(|m| m.at_ms <= segment.start_ms) {
+                        marker_line(ui, font_size, marker);
+                    }
                     let speaker = segment.speaker.as_deref();
                     ui.label(line(
                         ui,
@@ -240,6 +414,7 @@ impl Transcript {
                         segment.start_ms,
                         segment.source,
                         speaker,
+                        segment.filled,
                         &segment.text,
                         "",
                     ));
@@ -247,6 +422,9 @@ impl Transcript {
                         translation_line(ui, font_size, segment.id, &segment.translation, "");
                     }
                     ui.add_space(2.0);
+                }
+                for marker in markers {
+                    marker_line(ui, font_size, marker);
                 }
                 for source in [Source::Mic, Source::System] {
                     let Some(lane) = self.lanes.get(&source) else {
@@ -276,7 +454,7 @@ impl Transcript {
                             &pending
                         };
                         ui.label(line(
-                            ui, font_size, start_ms, source, speaker, settled, pending,
+                            ui, font_size, start_ms, source, speaker, false, settled, pending,
                         ));
                     }
                     if show_translation {
@@ -290,21 +468,22 @@ impl Transcript {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn line(
     ui: &egui::Ui,
     font_size: f32,
     start_ms: u64,
     source: Source,
     speaker: Option<&str>,
+    filled: bool,
     settled: &str,
     pending: &str,
 ) -> LayoutJob {
     let visuals = ui.visuals();
     let body = FontId::proportional(font_size);
     let mut job = LayoutJob::default();
-    let secs = start_ms / 1000;
     job.append(
-        &format!("{:02}:{:02}  ", secs / 60, secs % 60),
+        &format!("{}  ", clock(start_ms)),
         0.0,
         TextFormat::simple(
             FontId::monospace(font_size - 2.0),
@@ -319,6 +498,16 @@ fn line(
             speaker_color(source, speaker, visuals.dark_mode),
         ),
     );
+    if filled {
+        job.append(
+            "(filled) ",
+            0.0,
+            TextFormat::simple(
+                FontId::proportional(font_size - 2.0),
+                visuals.weak_text_color(),
+            ),
+        );
+    }
     job.append(
         settled,
         0.0,
@@ -335,6 +524,22 @@ fn line(
         },
     );
     job
+}
+
+/// A timeline note, e.g. "— Them: connection dropped 15:11, reconnected after 4 s —".
+fn marker_line(ui: &mut egui::Ui, font_size: f32, marker: &Marker) {
+    let who = match marker.source {
+        Source::Mic => "Me",
+        Source::System => "Them",
+    };
+    let text = format!("{}  — {who}: {} —", clock(marker.at_ms), marker.text);
+    ui.label(
+        egui::RichText::new(text)
+            .size(font_size - 2.0)
+            .italics()
+            .color(ui.visuals().warn_fg_color),
+    );
+    ui.add_space(2.0);
 }
 
 /// The translation under its segment, indented and in a muted colour.
@@ -389,7 +594,10 @@ fn speaker_color(source: Source, speaker: Option<&str>, dark: bool) -> Color32 {
     let index = match source {
         Source::Mic => 0,
         Source::System => {
-            let n: usize = speaker.and_then(|s| s.parse().ok()).unwrap_or(1);
+            let n: usize = speaker
+                .map(|s| s.trim_start_matches('F'))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1);
             1 + n.saturating_sub(1) % 4
         }
     };

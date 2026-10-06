@@ -62,7 +62,7 @@ fn main() -> Result<()> {
                 println!("\n[finished]");
                 return Ok(());
             }
-            Event::Failed(message) => bail!(message),
+            Event::Failed { reason, .. } => bail!(reason),
             event => handle(event),
         }
     }
@@ -70,8 +70,8 @@ fn main() -> Result<()> {
 
 fn print_events(rx: &mpsc::Receiver<Event>) -> Result<()> {
     while let Ok(event) = rx.try_recv() {
-        if let Event::Failed(message) = event {
-            bail!(message);
+        if let Event::Failed { reason, .. } = event {
+            bail!(reason);
         }
         handle(event);
     }
@@ -80,8 +80,10 @@ fn print_events(rx: &mpsc::Receiver<Event>) -> Result<()> {
 
 fn handle(event: Event) {
     match event {
-        Event::Connected => println!("[connected]"),
-        Event::Reconnecting { attempt, reason } => {
+        Event::Connected { .. } => println!("[connected]"),
+        Event::Reconnecting {
+            attempt, reason, ..
+        } => {
             println!("\n[reconnecting, attempt {attempt}: {reason}]")
         }
         Event::Tokens { finals, .. } => {
@@ -91,6 +93,9 @@ fn handle(event: Event) {
             use std::io::Write;
             let _ = std::io::stdout().flush();
         }
-        Event::Finished | Event::Failed(_) => {}
+        Event::AudioDropped { from_ms, to_ms } => {
+            println!("\n[not transcribed live: {from_ms}..{to_ms} ms]")
+        }
+        Event::Finished | Event::Failed { .. } => {}
     }
 }
